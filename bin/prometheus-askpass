@@ -1,0 +1,147 @@
+#!/usr/bin/python3
+"""OpenSSH askpass adapter; responses travel only over a private Unix socket."""
+import json
+import hashlib
+import re
+import os
+from pathlib import Path
+import resource
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def cached_passphrase(prompt, runtime):
+    # Reuse only existing private-key passphrases. PINs always go to the UI.
+    if os.environ.get("SSH_ASKPASS_PROMPT") in ("confirm", "none"):
+        return None
+    match = re.fullmatch(r"Enter passphrase for(?: RSA)? key '(.*)':\s*", prompt)
+    if not match:
+        match = re.fullmatch(r"Enter passphrase for (.*?)(?: \(will confirm each use\))?:\s*", prompt)
+    if not match:
+        return None
+    identifier = match.group(1)
+    if not identifier.startswith("/"):
+        return None
+    try:
+        import secretstorage
+        bus = secretstorage.dbus_init()
+        # Match QtKeychain's existing schema; never unlock a wallet implicitly.
+        attributes = {"server": "ksshaskpass", "user": identifier,
+                      "xdg:schema": "org.qt.keychain"}
+        for collection in secretstorage.get_all_collections(bus):
+            if collection.is_locked():
+                continue
+            for item in collection.search_items(attributes):
+                if item.is_locked():
+                    continue
+                value = item.get_secret().decode("utf-8")
+                if not value or "\n" in value or "\x00" in value:
+                    continue
+                # Do not repeatedly reuse a stale value when SSH asks again.
+                parent = os.getppid()
+                start = Path(f"/proc/{parent}/stat").read_text().rsplit(")", 1)[1].split()[19]
+                digest = hashlib.sha256(identifier.encode()).hexdigest()[:24]
+                directory = Path(runtime) / "prometheus-askpass-cache-use"
+                directory.mkdir(mode=0o700, exist_ok=True)
+                for old in directory.iterdir():
+                    if old.is_file() and time.time() - old.stat().st_mtime > 86400:
+                        old.unlink(missing_ok=True)
+                marker = directory / f"{parent}-{start}-{digest}"
+                try:
+                    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.close(fd)
+                except FileExistsError:
+                    return None
+                return value
+    except Exception:
+        # A missing/locked keyring falls back to the Quickshell prompt.
+        return None
+    return None
+
+
+def main():
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    prompt = " ".join(sys.argv[1:]) or "Enter SSH passphrase:"
+    cached = cached_passphrase(prompt, runtime)
+    if cached is not None:
+        sys.stdout.write(cached + "\n")
+        sys.stdout.flush()
+        return 0
+    config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "quickshell/prometheus-askpass/shell.qml"
+    with tempfile.TemporaryDirectory(prefix="prometheus-askpass-", dir=runtime) as directory:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            address = directory + "/response.sock"
+            server.bind(address)
+            server.listen(1)
+            server.settimeout(0.25)
+            env = os.environ.copy()
+            env.update(PROMETHEUS_ASKPASS_SOCKET=address,
+                       PROMETHEUS_ASKPASS_TEXT=prompt)
+            # stdout is reserved exclusively for the response to OpenSSH.
+            process = subprocess.Popen(["/usr/bin/quickshell", "--path", str(config)],
+                                       env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 600
+                while process.poll() is None and time.monotonic() < deadline:
+                    try:
+                        connection, _ = server.accept()
+                        break
+                    except socket.timeout:
+                        continue
+                else:
+                    return 1
+                with connection:
+                    _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                    if uid != os.getuid():
+                        return 1
+                    connection.settimeout(0.25)
+                    data = bytearray()
+                    while process.poll() is None and time.monotonic() < deadline:
+                        try:
+                            chunk = connection.recv(4096)
+                        except socket.timeout:
+                            continue
+                        if not chunk:
+                            return 1
+                        data.extend(chunk)
+                        if len(data) > 1048576:
+                            return 1
+                        if b"\n" in data:
+                            reply = json.loads(data.split(b"\n", 1)[0])
+                            if reply.get("accepted") is not True:
+                                return 1
+                            value = reply.get("response", "")
+                            if not isinstance(value, str) or "\n" in value or "\x00" in value:
+                                return 1
+                            sys.stdout.write(value + "\n")
+                            sys.stdout.flush()
+                            return 0
+                return 1
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+
+
+def interrupted(signum, frame):
+    raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyboardInterrupt):
+        sys.exit(1)
